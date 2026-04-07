@@ -1,0 +1,278 @@
+---
+- name: Deploy node in Docker on EC2
+  hosts: all
+  become: yes
+  vars:
+    app_dir: /opt/app
+    app_port: 3000
+    app_container_name: node-app
+    node_env_database_url: "{{ node_env_database_url | default('') }}"
+    node_env_mongo_uri: "{{ node_env_mongo_uri | default('') }}"
+    node_env_db_host: "{{ node_env_db_host | default('') }}"
+    node_env_db_port: "{{ node_env_db_port | default('') }}"
+    node_env_db_name: "{{ node_env_db_name | default('') }}"
+    node_env_db_user: "{{ node_env_db_user | default('') }}"
+    node_env_db_password: "{{ node_env_db_password | default('') }}"
+    install_db: "{{ install_db | default('false') }}"
+    db_type: "{{ db_type | default('') }}"
+    db_name: "{{ db_name | default('') }}"
+    db_username: "{{ db_username | default('') }}"
+    db_password: "{{ db_password | default('') }}"
+
+  tasks:
+    # ── Docker installation ────────────────────────────────────────────────────
+    - name: Install apt dependencies for Docker
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+        update_cache: yes
+
+    - name: Add Docker GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker apt repository
+      apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu jammy stable"
+        state: present
+
+    - name: Install Docker CE
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+        state: present
+        update_cache: yes
+
+    - name: Start and enable Docker service
+      service:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Add ubuntu user to docker group
+      user:
+        name: ubuntu
+        groups: docker
+        append: yes
+
+    - name: Reset SSH connection so docker group change takes effect
+      meta: reset_connection
+
+    # ── nginx installation and reverse-proxy config ────────────────────────────
+    - name: Install nginx
+      apt:
+        name: nginx
+        state: present
+        update_cache: yes
+
+    - name: Configure nginx reverse proxy to port 3000
+      copy:
+        content: |
+          server {
+              listen 80;
+              server_name _;
+              location / {
+                  proxy_pass http://127.0.0.1:3000;
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection 'upgrade';
+                  proxy_set_header Host $host;
+                  proxy_cache_bypass $http_upgrade;
+              }
+          }
+        dest: /etc/nginx/sites-available/default
+        mode: '0644'
+
+    - name: Enable nginx site
+      file:
+        src: /etc/nginx/sites-available/default
+        dest: /etc/nginx/sites-enabled/default
+        state: link
+        force: yes
+
+    - name: Start and enable nginx
+      service:
+        name: nginx
+        state: restarted
+        enabled: yes
+
+    # ── Optional: install PostgreSQL locally ───────────────────────────────────
+    - name: Install PostgreSQL
+      apt:
+        name: postgresql
+        state: present
+        update_cache: yes
+      when: install_db == 'true' and db_type == 'postgres'
+
+    - name: Start and enable PostgreSQL
+      service:
+        name: postgresql
+        state: started
+        enabled: yes
+      when: install_db == 'true' and db_type == 'postgres'
+
+    - name: Fix pg_hba.conf to use md5 authentication
+      shell: |
+        HBA=$(find /etc/postgresql -name pg_hba.conf | head -1)
+        sed -i 's/scram-sha-256/md5/g' "$HBA"
+        systemctl reload postgresql
+      when: install_db == 'true' and db_type == 'postgres'
+
+    - name: Create PostgreSQL database
+      shell: |
+        sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='{{ db_name }}'" | grep -q 1 || \
+        sudo -u postgres psql -c "CREATE DATABASE {{ db_name }};"
+      when: install_db == 'true' and db_type == 'postgres' and db_name != ''
+
+    - name: Create PostgreSQL user
+      shell: |
+        sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='{{ db_username }}'" | grep -q 1 || \
+        sudo -u postgres psql -c "CREATE USER {{ db_username }} WITH ENCRYPTED PASSWORD '{{ db_password }}';"
+      when: install_db == 'true' and db_type == 'postgres' and db_username != ''
+
+    - name: Grant privileges to PostgreSQL user
+      shell: |
+        sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE {{ db_name }} TO {{ db_username }};"
+      when: install_db == 'true' and db_type == 'postgres' and db_name != '' and db_username != ''
+
+    # ── Wipe and recreate app directory ───────────────────────────────────────
+    - name: Wipe old app directory
+      file:
+        path: "{{ app_dir }}"
+        state: absent
+      ignore_errors: yes
+
+    - name: Recreate app directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        mode: '0755'
+
+    # ── Copy project files ─────────────────────────────────────────────────────
+    - name: Copy all project files to app directory
+      copy:
+        src: ../
+        dest: "{{ app_dir }}/"
+        mode: '0755'
+
+    # ── Write Dockerfile if not present ───────────────────────────────────────
+    - name: Check if Dockerfile exists
+      stat:
+        path: "{{ app_dir }}/Dockerfile"
+      register: dockerfile_stat
+
+    - name: Write default Dockerfile for Node 22
+      copy:
+        content: |
+          FROM node:22-alpine
+          WORKDIR /app
+          COPY package*.json ./
+          RUN npm install
+          COPY . .
+          RUN if grep -q '"build"' package.json; then npm run build; fi
+          EXPOSE 3000
+          CMD ["npm", "start"]
+        dest: "{{ app_dir }}/Dockerfile"
+        mode: '0644'
+      when: not dockerfile_stat.stat.exists
+
+    # ── Write .env file using shell (never copy module) ───────────────────────
+    - name: Write .env file
+      shell: |
+        printf '' > {{ app_dir }}/.env
+        {% if node_env_database_url != '' %}
+        printf 'DATABASE_URL=%s\n' '{{ node_env_database_url }}' >> {{ app_dir }}/.env
+        {% endif %}
+        {% if node_env_mongo_uri != '' %}
+        printf 'MONGO_URI=%s\n' '{{ node_env_mongo_uri }}' >> {{ app_dir }}/.env
+        {% endif %}
+        {% if node_env_db_host != '' %}
+        printf 'DB_HOST=%s\n' '{{ node_env_db_host }}' >> {{ app_dir }}/.env
+        {% endif %}
+        {% if node_env_db_port != '' %}
+        printf 'DB_PORT=%s\n' '{{ node_env_db_port }}' >> {{ app_dir }}/.env
+        {% endif %}
+        {% if node_env_db_name != '' %}
+        printf 'DB_NAME=%s\n' '{{ node_env_db_name }}' >> {{ app_dir }}/.env
+        {% endif %}
+        {% if node_env_db_user != '' %}
+        printf 'DB_USER=%s\n' '{{ node_env_db_user }}' >> {{ app_dir }}/.env
+        {% endif %}
+        {% if node_env_db_password != '' %}
+        printf 'DB_PASSWORD=%s\n' '{{ node_env_db_password }}' >> {{ app_dir }}/.env
+        {% endif %}
+        printf 'PORT=3000\n' >> {{ app_dir }}/.env
+        printf 'HOST=0.0.0.0\n' >> {{ app_dir }}/.env
+        printf 'NODE_ENV=production\n' >> {{ app_dir }}/.env
+
+    # ── Stop and remove old container and image ────────────────────────────────
+    - name: Stop existing container
+      shell: docker stop {{ app_container_name }} || true
+
+    - name: Remove existing container
+      shell: docker rm {{ app_container_name }} || true
+
+    - name: Remove old image to force rebuild
+      shell: docker rmi {{ app_container_name }}:latest || true
+
+    # ── Build and run container ────────────────────────────────────────────────
+    - name: Build Docker image
+      shell: docker build --no-cache -t {{ app_container_name }}:latest {{ app_dir }}/
+
+    - name: Run Docker container
+      shell: >
+        docker run -d
+        --name {{ app_container_name }}
+        --network host
+        --restart always
+        --env-file {{ app_dir }}/.env
+        {{ app_container_name }}:latest
+
+    # ── Verify the app is reachable ────────────────────────────────────────────
+    - name: Wait for app to be reachable on port 3000
+      wait_for:
+        host: 127.0.0.1
+        port: "{{ app_port }}"
+        delay: 10
+        timeout: 120
+        state: started
+      ignore_errors: yes
+      register: port_wait
+
+    - name: Dump container logs if app did not start
+      shell: docker logs --tail 100 {{ app_container_name }}
+      register: container_logs
+      when: port_wait is failed
+
+    - name: Show container logs
+      debug:
+        msg: "{{ container_logs.stdout_lines | default(['No logs captured']) }}"
+      when: port_wait is failed
+
+    - name: Fail clearly if app did not start
+      fail:
+        msg: >
+          App did not start on port {{ app_port }} within 120 seconds.
+          Check the Docker logs above. Common causes: missing build step,
+          crashed script, wrong entrypoint, or mismatched port.
+      when: port_wait is failed
+
+    - name: Verify container is running
+      shell: docker ps --filter name={{ app_container_name }} --filter status=running --format '{{ '{{' }}.Names{{ '}}' }}'
+      register: container_check
+      retries: 3
+      delay: 5
+      until: container_check.stdout != ""
+      become: yes
+
+    - name: Report server IP
+      debug:
+        msg: "server_ip={{ ansible_host }}"
